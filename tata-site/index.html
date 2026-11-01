@@ -130,6 +130,22 @@
   }
   canvas{display:block; width:100%; height:auto; touch-action:none}
   .board canvas{cursor:crosshair}
+  .heart-cv,.star-cv{touch-action:none}
+
+  .seq-wrap{max-width:400px; margin:0 auto}
+  .seq-grid{display:grid; grid-template-columns:repeat(3,1fr); gap:10px}
+  .seq-cell{
+    aspect-ratio:1; border:1px solid var(--line); background:var(--card); border-radius:14px;
+    display:flex; align-items:center; justify-content:center; font-size:26px; color:var(--ink);
+    cursor:pointer; padding:0; transition:transform .12s ease, background .12s ease, color .12s ease;
+    -webkit-user-select:none; user-select:none; -webkit-tap-highlight-color:transparent;
+  }
+  .seq-cell:active{transform:scale(.97)}
+  .seq-cell.lit{background:var(--ink); color:#fdfbf6; transform:scale(.95)}
+  .seq-cell.ok{background:#e8efe1; color:#4b6141}
+  .seq-cell.bad{background:#fae3e0; color:#9c4a3e}
+  .seq-cell[disabled]{cursor:default; opacity:.92}
+  .seq-hint{font-size:12.5px; color:var(--muted); margin-top:14px; text-align:center; min-height:20px}
 
   .ov{
     position:absolute; inset:0; display:flex; flex-direction:column;
@@ -845,7 +861,10 @@
     { id: 'tug', idx: '10', tag: '双人', title: '双人拔河', desc: '一个按 A 一个按 L，把红布拉过自己那条线。' },
     { id: 'memory', idx: '11', tag: '单人', title: '记忆翻牌', desc: '六到十对图案翻着找，看看几步能清空。' },
     { id: 'cards', idx: '12', tag: '互动', title: '抽卡字卡', desc: '给喜欢的角色做一套卡片，想 ta 的时候抽一张。' },
-    { id: 'match', idx: '13', tag: '互动', title: '合拍卡', desc: '两张头像加一串项目，数值和文案都能自己写。' }
+    { id: 'match', idx: '13', tag: '互动', title: '合拍卡', desc: '两张头像加一串项目，数值和文案都能自己写。' },
+    { id: 'heart', idx: '14', tag: '双人', title: '一起画心', desc: '两个人各描一半虚线，松手看看合起来有多像一颗心。' },
+    { id: 'star', idx: '15', tag: '解压', title: '接星星', desc: '小篮子左右移动，接住掉下来的星星，漏三颗就结束。' },
+    { id: 'seq', idx: '16', tag: '双人', title: '记住这个顺序', desc: '两个人都要复现同一串亮起的格子，谁记错谁输。' }
   ];
 
   function renderCards() {
@@ -4575,8 +4594,812 @@
     tug: { title: '双人拔河', create: createTug },
     memory: { title: '记忆翻牌', create: createMemory },
     cards: { title: '抽卡字卡', create: createCards },
-    match: { title: '合拍卡', create: createMatch }
+    match: { title: '合拍卡', create: createMatch },
+    heart: { title: '一起画心', create: createHeart },
+    star: { title: '接星星', create: createStar },
+    seq: { title: '记住这个顺序', create: createSequence }
   };
+
+  /* ==================== 14 一起画心 ==================== */
+  function createHeart(root) {
+    var $ = function (s) { return root.querySelector(s); };
+    root.innerHTML =
+      '<div class="gbar">' +
+        '<div class="stat"><span>合心度</span><b class="js-score">—</b></div>' +
+        '<div class="stat"><span>左 / 右</span><b class="js-side">— / —</b></div>' +
+        '<div class="stat"><span>最高</span><b class="js-best">0</b></div>' +
+      '</div>' +
+      '<div class="board"><canvas class="js-cv heart-cv"></canvas></div>' +
+      '<div class="rowline">' +
+        '<button class="btn ghost mini js-reset" type="button">再画一遍</button>' +
+        '<span class="hint js-tip" style="margin:0">按住画面就能画</span>' +
+      '</div>' +
+      '<div class="hint">一个人按住左半边描左边那条线，一个人按住右半边描右边，两个人一起按也行。都松手之后，会算出你们合起来的这颗心有多像。</div>';
+
+    var cv = $('.js-cv');
+    var ctx = setupCanvas(cv, 66, 42, 10);
+    var W = 660, H = 420, CX = 330, CY = 192, SC = 9;
+
+    var PINK = '212,117,111', BLUE = '91,123,140';
+    var guide = [], sides = { L: [], R: [] }, live = {}, result = null;
+    var raf = 0, pulse = 0, plays = stats.heartCount || 0;
+
+    (function build() {
+      var n = 280;
+      for (var i = 0; i < n; i++) {
+        var t = (i / n) * Math.PI * 2;
+        var hx = 16 * Math.pow(Math.sin(t), 3);
+        var hy = 13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t);
+        guide.push({ x: CX + hx * SC, y: CY - hy * SC, side: hx <= 0 ? 'L' : 'R' });
+      }
+    })();
+
+    $('.js-best').textContent = stats.heartBest || 0;
+
+    function verdict(v) {
+      if (v >= 95) return '你们大概共用一个心脏';
+      if (v >= 86) return '很像一颗心了';
+      if (v >= 72) return '有点意思，再描一次会更准';
+      if (v >= 55) return '形状还有点飘';
+      return '这也算一种心吧';
+    }
+
+    function toCv(e) {
+      var rc = cv.getBoundingClientRect();
+      return {
+        x: (e.clientX - rc.left) * (W / rc.width),
+        y: (e.clientY - rc.top) * (H / rc.height)
+      };
+    }
+
+    function scoreSide(side) {
+      var drawn = sides[side];
+      if (!drawn || drawn.length < 8) return null;
+      var gp = [], i, j;
+      for (i = 0; i < guide.length; i++) if (guide[i].side === side) gp.push(guide[i]);
+      var cov = 0, sum = 0;
+      for (i = 0; i < gp.length; i++) {
+        var bd = 1e9;
+        for (j = 0; j < drawn.length; j++) {
+          var dx = gp[i].x - drawn[j].x, dy = gp[i].y - drawn[j].y;
+          var dd = dx * dx + dy * dy;
+          if (dd < bd) bd = dd;
+        }
+        bd = Math.sqrt(bd);
+        if (bd < 22) cov++;
+        sum += Math.min(bd, 60);
+      }
+      var avg = sum / gp.length;
+      var close = Math.max(0, 100 - avg * 4.2);
+      var cover = (cov / gp.length) * 100;
+      return Math.round(Math.max(0, Math.min(100, cover * 0.5 + close * 0.5)));
+    }
+
+    function judge() {
+      var L = scoreSide('L'), R = scoreSide('R');
+      var tip = $('.js-tip');
+      if (L === null || R === null) {
+        result = null;
+        $('.js-score').textContent = '—';
+        $('.js-side').textContent = (L === null ? '—' : L) + ' / ' + (R === null ? '—' : R);
+        if (L === null && R === null) tip.textContent = '按住画面就能画';
+        else if (L === null) tip.textContent = '左半边还空着，叫个人来按住左边';
+        else tip.textContent = '右半边还空着，叫个人来按住右边';
+        return;
+      }
+      var total = Math.round((L + R) / 2);
+      result = { total: total, L: L, R: R };
+      $('.js-score').textContent = total + '%';
+      $('.js-side').textContent = L + ' / ' + R;
+      tip.textContent = '';
+      plays++;
+      stats.heartCount = plays;
+      if (total > (stats.heartBest || 0)) {
+        stats.heartBest = total;
+        $('.js-best').textContent = total;
+      }
+      save(K.stats, stats);
+      pulse = performance.now();
+      Sfx.win();
+    }
+
+    function begin(id, p) {
+      live[id] = { side: p.x < CX ? 'L' : 'R', pts: [{ x: p.x, y: p.y }] };
+    }
+    function moveTo(id, p) {
+      var st = live[id];
+      if (!st) return;
+      var q = st.pts[st.pts.length - 1];
+      var dx = p.x - q.x, dy = p.y - q.y;
+      if (dx * dx + dy * dy < 6) return;
+      st.pts.push({ x: p.x, y: p.y });
+    }
+    function finish(id) {
+      var st = live[id];
+      if (!st) return;
+      delete live[id];
+      if (st.pts.length > 3) sides[st.side] = st.pts;
+      judge();
+    }
+
+    function stroke(pts, color) {
+      if (!pts || pts.length < 2) return;
+      ctx.save();
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+      ctx.strokeStyle = 'rgba(' + color + ',.16)';
+      ctx.lineWidth = 10;
+      ctx.stroke();
+      ctx.strokeStyle = 'rgba(' + color + ',.94)';
+      ctx.lineWidth = 3.6;
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function pathGuide() {
+      ctx.beginPath();
+      for (var i = 0; i < guide.length; i++) {
+        var p = guide[i];
+        if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
+      }
+      ctx.closePath();
+    }
+
+    function draw(now) {
+      var g = ctx.createLinearGradient(0, 0, 0, H);
+      g.addColorStop(0, '#fdfaf2');
+      g.addColorStop(1, '#f4eee0');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, W, H);
+
+      ctx.fillStyle = 'rgba(120,110,95,.11)';
+      for (var gx = 30; gx < W; gx += 40) {
+        for (var gy = 30; gy < H; gy += 40) ctx.fillRect(gx, gy, 1.6, 1.6);
+      }
+
+      if (result) {
+        var kk = result.total / 100;
+        var pr = 1 + Math.sin((now - pulse) / 430) * 0.013 * kk;
+        ctx.save();
+        ctx.translate(CX, CY + 18);
+        ctx.scale(pr, pr);
+        ctx.translate(-CX, -(CY + 18));
+        pathGuide();
+        var fg = ctx.createLinearGradient(CX - 144, CY - 120, CX + 144, CY + 155);
+        fg.addColorStop(0, 'rgba(232,168,176,' + (0.08 + kk * 0.5).toFixed(2) + ')');
+        fg.addColorStop(1, 'rgba(208,116,126,' + (0.06 + kk * 0.4).toFixed(2) + ')');
+        ctx.fillStyle = fg;
+        ctx.fill();
+        ctx.restore();
+      }
+
+      ctx.save();
+      ctx.setLineDash([6, 8]);
+      pathGuide();
+      ctx.strokeStyle = 'rgba(150,138,120,.45)';
+      ctx.lineWidth = 1.4;
+      ctx.stroke();
+      ctx.restore();
+
+      stroke(sides.L, PINK);
+      stroke(sides.R, BLUE);
+      for (var pid in live) {
+        if (live.hasOwnProperty(pid)) stroke(live[pid].pts, live[pid].side === 'L' ? PINK : BLUE);
+      }
+
+      ctx.save();
+      ctx.textAlign = 'center';
+      if (result) {
+        ctx.fillStyle = 'rgba(58,50,42,.88)';
+        ctx.font = '600 30px -apple-system,sans-serif';
+        ctx.fillText(result.total + '%', W / 2, H - 46);
+        ctx.font = '12.5px -apple-system,sans-serif';
+        ctx.fillStyle = 'rgba(112,102,90,.92)';
+        ctx.fillText(verdict(result.total), W / 2, H - 22);
+      } else {
+        ctx.font = '12.5px -apple-system,sans-serif';
+        ctx.fillStyle = 'rgba(140,130,115,.85)';
+        ctx.fillText('沿着虚线，各画一半', W / 2, H - 30);
+      }
+      ctx.restore();
+    }
+
+    function frame(ts) {
+      draw(ts);
+      raf = window.requestAnimationFrame(frame);
+    }
+
+    cv.addEventListener('pointerdown', function (e) {
+      e.preventDefault();
+      if (cv.setPointerCapture) { try { cv.setPointerCapture(e.pointerId); } catch (err) {} }
+      begin('p' + e.pointerId, toCv(e));
+    });
+    cv.addEventListener('pointermove', function (e) {
+      moveTo('p' + e.pointerId, toCv(e));
+    });
+    function onUp(e) { finish('p' + e.pointerId); }
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+
+    $('.js-reset').addEventListener('click', function () {
+      sides = { L: [], R: [] };
+      live = {};
+      result = null;
+      $('.js-score').textContent = '—';
+      $('.js-side').textContent = '— / —';
+      $('.js-tip').textContent = '按住画面就能画';
+      Sfx.click(480);
+    });
+
+    raf = window.requestAnimationFrame(frame);
+
+    return {
+      teardown: function () {
+        window.cancelAnimationFrame(raf);
+        window.removeEventListener('pointerup', onUp);
+        window.removeEventListener('pointercancel', onUp);
+      },
+      pause: function () {},
+      resume: function () {},
+      isPlaying: function () { return false; }
+    };
+  }
+
+  /* ==================== 15 接星星 ==================== */
+  function createStar(root) {
+    var $ = function (s) { return root.querySelector(s); };
+    root.innerHTML =
+      '<div class="gbar">' +
+        '<div class="stat"><span>接住</span><b class="js-score">0</b></div>' +
+        '<div class="stat"><span>连击</span><b class="js-combo">0</b></div>' +
+        '<div class="stat"><span>最高</span><b class="js-best">0</b></div>' +
+      '</div>' +
+      '<div class="rowline"><div class="js-diff"></div></div>' +
+      '<div class="board">' +
+        '<canvas class="js-cv star-cv"></canvas>' +
+        '<div class="ov js-ov">' +
+          '<div class="ov-kicker js-k">ready</div>' +
+          '<div class="ov-title js-t">接星星</div>' +
+          '<div class="ov-sub js-s">左右移动小篮子，接住掉下来的星星。金星星值三分，漏掉三颗就结束。</div>' +
+          '<button class="btn js-btn">开始（空格）</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="hint">鼠标移动、手指拖动、<kbd>←</kbd><kbd>→</kbd> 或 <kbd>A</kbd><kbd>D</kbd> 都能控制篮子。</div>';
+
+    var cv = $('.js-cv');
+    var ctx = setupCanvas(cv, 66, 42, 10);
+    var W = 660, H = 420;
+    var BY = H - 46, BW = 108;
+
+    var ov = $('.js-ov'), ovK = $('.js-k'), ovT = $('.js-t'), ovS = $('.js-s'), ovBtn = $('.js-btn');
+    var elScore = $('.js-score'), elCombo = $('.js-combo'), elBest = $('.js-best');
+
+    var CEN = { L: false, R: false };
+    var bx = W / 2, tx = W / 2;
+    var items = [], sparks = [], sky = [];
+    var score = 0, combo = 0, lives = 3, acc = 0, elapsed = 0, state = 'ready';
+    var best = stats.starBest || 0, newRecord = false;
+    var raf = 0, last = 0;
+
+    var CFG = {
+      easy: { speed: 92, spawn: 1020, big: 0.10 },
+      normal: { speed: 148, spawn: 720, big: 0.12 },
+      hard: { speed: 212, spawn: 520, big: 0.15 }
+    };
+
+    for (var i = 0; i < 70; i++) {
+      sky.push({
+        x: Math.random() * W,
+        y: Math.random() * (H - 60),
+        r: 0.5 + Math.random() * 1.4,
+        ph: Math.random() * 6.28,
+        sp: 0.5 + Math.random() * 1.4
+      });
+    }
+
+    $('.js-diff').appendChild(diffBar('star', function () { acc = 0; }));
+    elBest.textContent = best;
+
+    function hud() {
+      elScore.textContent = score;
+      elCombo.textContent = combo;
+      elBest.textContent = best;
+    }
+
+    function showOv(kind) {
+      if (kind === 'ready') {
+        ovK.textContent = 'ready';
+        ovT.textContent = '接星星';
+        ovS.textContent = '左右移动小篮子，接住掉下来的星星。金星星值三分，漏掉三颗就结束。';
+        ovBtn.textContent = '开始（空格）';
+      } else if (kind === 'over') {
+        ovK.textContent = 'night over';
+        ovT.textContent = lives > 0 ? '先歇一下' : '篮子空了';
+        ovS.textContent = (newRecord ? '新纪录 · ' : '') + '这局接住 ' + score + ' 颗，最高连击 ' + bestCombo() + '。';
+        ovBtn.textContent = '再来一局（空格）';
+      }
+      ov.hidden = false;
+    }
+
+    var comboTop = 0;
+    function bestCombo() { return comboTop; }
+
+    function reset() {
+      items = [];
+      sparks = [];
+      score = 0; combo = 0; comboTop = 0; lives = 3; acc = 0; elapsed = 0;
+      bx = W / 2; tx = W / 2;
+      newRecord = false;
+      hud();
+    }
+
+    function start() {
+      reset();
+      state = 'playing';
+      ov.hidden = true;
+      Sfx.click(520);
+    }
+
+    function spawn() {
+      var c = CFG[diffOf('star')] || CFG.easy;
+      var big = Math.random() < c.big;
+      items.push({
+        x: 44 + Math.random() * (W - 88),
+        y: -24,
+        vy: (c.speed + Math.random() * 34) * (big ? 1.1 : 1),
+        big: big,
+        ph: Math.random() * 6.28,
+        rot: Math.random() * 6.28,
+        spin: (Math.random() - 0.5) * 0.05
+      });
+    }
+
+    function burst(x, y, color, n) {
+      for (var i = 0; i < n; i++) {
+        var a = Math.random() * Math.PI * 2;
+        var s = 0.6 + Math.random() * 2.2;
+        sparks.push({ x: x, y: y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 0.6, life: 1, c: color });
+      }
+    }
+
+    function catched(it) {
+      var add = it.big ? 3 : 1;
+      score += add;
+      combo++;
+      if (combo > comboTop) comboTop = combo;
+      if (combo > 0 && combo % 10 === 0) score += 5;
+      burst(it.x, BY - 6, it.big ? '235,196,110' : '246,222,168', it.big ? 16 : 9);
+      Sfx.pop(Math.min(8, 1 + Math.floor(combo / 3)));
+      hud();
+    }
+
+    function missed(it) {
+      lives--;
+      combo = 0;
+      burst(it.x, H - 26, '150,160,190', 7);
+      Sfx.click(180);
+      hud();
+      if (lives <= 0) over();
+    }
+
+    function over() {
+      state = 'over';
+      if (score > best) {
+        best = score;
+        stats.starBest = best;
+        newRecord = true;
+        save(K.stats, stats);
+      }
+      hud();
+      showOv('over');
+    }
+
+    function starPath(x, y, r, rot) {
+      ctx.beginPath();
+      for (var i = 0; i < 10; i++) {
+        var a = rot + (Math.PI / 5) * i - Math.PI / 2;
+        var rr = i % 2 === 0 ? r : r * 0.44;
+        var px = x + Math.cos(a) * rr, py = y + Math.sin(a) * rr;
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+    }
+
+    function drawBasket(ts) {
+      var x = bx, y = BY;
+      var wob = Math.sin(ts / 260) * (state === 'playing' ? 1.4 : 0.5);
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(wob * 0.004);
+      ctx.beginPath();
+      ctx.moveTo(-BW / 2, 0);
+      ctx.lineTo(BW / 2, 0);
+      ctx.quadraticCurveTo(BW / 2 - 8, 34, 0, 38);
+      ctx.quadraticCurveTo(-BW / 2 + 8, 34, -BW / 2, 0);
+      ctx.closePath();
+      var bg = ctx.createLinearGradient(0, 0, 0, 38);
+      bg.addColorStop(0, '#e9cfa6');
+      bg.addColorStop(1, '#cfae83');
+      ctx.fillStyle = bg;
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(120,92,62,.75)';
+      ctx.lineWidth = 1.6;
+      ctx.stroke();
+
+      ctx.save();
+      ctx.clip();
+      ctx.strokeStyle = 'rgba(120,92,62,.38)';
+      ctx.lineWidth = 1;
+      for (var i = -4; i <= 4; i++) {
+        ctx.beginPath();
+        ctx.moveTo(i * 13, -2);
+        ctx.lineTo(i * 11, 40);
+        ctx.stroke();
+      }
+      for (var j = 1; j <= 3; j++) {
+        ctx.beginPath();
+        ctx.ellipse(0, j * 9, BW / 2 - j * 3, 6 + j * 1.4, 0, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      ctx.restore();
+
+      ctx.beginPath();
+      ctx.ellipse(0, 0, BW / 2, 8.5, 0, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(247,232,208,.95)';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(120,92,62,.8)';
+      ctx.lineWidth = 1.8;
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function drawLives() {
+      for (var i = 0; i < 3; i++) {
+        var on = i < lives;
+        var x = 26 + i * 22, y = 26;
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(x, y + 5);
+        ctx.bezierCurveTo(x - 9, y - 3, x - 5, y - 10, x, y - 5);
+        ctx.bezierCurveTo(x + 5, y - 10, x + 9, y - 3, x, y + 5);
+        ctx.closePath();
+        ctx.fillStyle = on ? 'rgba(232,140,146,.95)' : 'rgba(255,255,255,.16)';
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    function draw(ts) {
+      var g = ctx.createLinearGradient(0, 0, W * 0.4, H);
+      g.addColorStop(0, '#1e2742');
+      g.addColorStop(0.62, '#2b3556');
+      g.addColorStop(1, '#39406a');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, W, H);
+
+      sky.forEach(function (s) {
+        var tw = 0.35 + 0.65 * Math.abs(Math.sin(ts / 1400 * s.sp + s.ph));
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255,252,240,' + (tw * 0.85).toFixed(2) + ')';
+        ctx.fill();
+      });
+
+      // 月亮
+      ctx.save();
+      var mg = ctx.createRadialGradient(W - 92, 78, 6, W - 92, 78, 62);
+      mg.addColorStop(0, 'rgba(255,246,214,.42)');
+      mg.addColorStop(1, 'rgba(255,246,214,0)');
+      ctx.fillStyle = mg;
+      ctx.beginPath();
+      ctx.arc(W - 92, 78, 62, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(W - 92, 78, 26, 0, Math.PI * 2);
+      ctx.fillStyle = '#fdf3d2';
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(W - 82, 70, 22, 0, Math.PI * 2);
+      ctx.fillStyle = '#27304f';
+      ctx.fill();
+      ctx.restore();
+
+      items.forEach(function (it) {
+        var rot = it.rot + ts * 0.001 * (it.spin > 0 ? 1 : -1);
+        var r = it.big ? 17 : 11;
+        ctx.save();
+        ctx.shadowColor = 'rgba(255,224,150,.75)';
+        ctx.shadowBlur = it.big ? 22 : 14;
+        starPath(it.x, it.y, r, rot);
+        var sg = ctx.createLinearGradient(it.x, it.y - r, it.x, it.y + r);
+        sg.addColorStop(0, it.big ? '#fff2c4' : '#ffeeb8');
+        sg.addColorStop(1, it.big ? '#f0c261' : '#f4d98a');
+        ctx.fillStyle = sg;
+        ctx.fill();
+        ctx.restore();
+        ctx.beginPath();
+        starPath(it.x, it.y, r, rot);
+        ctx.strokeStyle = 'rgba(190,140,60,.55)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      });
+
+      drawBasket(ts);
+
+      sparks.forEach(function (s) {
+        ctx.beginPath();
+        ctx.arc(s.x, s.y, 1.8 * s.life + 0.4, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(' + s.c + ',' + (s.life * 0.9).toFixed(2) + ')';
+        ctx.fill();
+      });
+
+      drawLives();
+
+      if (combo >= 5) {
+        ctx.fillStyle = 'rgba(255,240,205,.9)';
+        ctx.font = '600 13px -apple-system,sans-serif';
+        ctx.fillText('连击 ×' + combo, 24, 62);
+      }
+    }
+
+    function frame(ts) {
+      var dt = last ? Math.min(48, ts - last) : 16;
+      last = ts;
+      var k = dt / 16.7;
+
+      if (state === 'playing') {
+        elapsed += dt;
+        if (CEN.L) tx -= 10 * k;
+        if (CEN.R) tx += 10 * k;
+        tx = Math.max(BW / 2 + 6, Math.min(W - BW / 2 - 6, tx));
+        bx += (tx - bx) * Math.min(1, 0.3 * k);
+
+        acc += dt;
+        var c = CFG[diffOf('star')] || CFG.easy;
+        var iv = Math.max(340, c.spawn - elapsed * 0.055);
+        if (acc > iv) { acc = 0; spawn(); }
+
+        for (var i = items.length - 1; i >= 0; i--) {
+          var it = items[i];
+          it.y += (it.vy * dt) / 1000;
+          it.x += Math.sin(ts / 700 + it.ph) * 0.35 * k;
+
+          if (it.y > BY - 16 && it.y < BY + 18 && Math.abs(it.x - bx) < BW / 2 - 2) {
+            catched(it);
+            items.splice(i, 1);
+            continue;
+          }
+          if (it.y > H + 26) {
+            items.splice(i, 1);
+            missed(it);
+          }
+        }
+      }
+
+      sparks.forEach(function (s) {
+        s.x += s.vx * k;
+        s.y += s.vy * k;
+        s.vy += 0.06 * k;
+        s.life -= 0.035 * k;
+      });
+      sparks = sparks.filter(function (s) { return s.life > 0; });
+
+      draw(ts);
+      raf = window.requestAnimationFrame(frame);
+    }
+
+    function px(e) {
+      var rc = cv.getBoundingClientRect();
+      return (e.clientX - rc.left) * (W / rc.width);
+    }
+
+    cv.addEventListener('pointerdown', function (e) {
+      e.preventDefault();
+      if (state !== 'playing') return;
+      tx = Math.max(BW / 2 + 6, Math.min(W - BW / 2 - 6, px(e)));
+    });
+    cv.addEventListener('pointermove', function (e) {
+      if (state !== 'playing') return;
+      if (e.buttons === 0 && e.pointerType === 'mouse') {
+        tx = Math.max(BW / 2 + 6, Math.min(W - BW / 2 - 6, px(e)));
+      } else if (e.pointerType !== 'mouse') {
+        tx = Math.max(BW / 2 + 6, Math.min(W - BW / 2 - 6, px(e)));
+      }
+    });
+
+    function onKey(e) {
+      var kk = e.key;
+      if (kk === 'ArrowLeft' || kk === 'a' || kk === 'A') { CEN.L = true; e.preventDefault(); }
+      else if (kk === 'ArrowRight' || kk === 'd' || kk === 'D') { CEN.R = true; e.preventDefault(); }
+      else if (kk === ' ' || kk === 'Spacebar') {
+        e.preventDefault();
+        if (state !== 'playing') start();
+      }
+    }
+    function onKeyUp(e) {
+      var kk = e.key;
+      if (kk === 'ArrowLeft' || kk === 'a' || kk === 'A') CEN.L = false;
+      else if (kk === 'ArrowRight' || kk === 'd' || kk === 'D') CEN.R = false;
+    }
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('keyup', onKeyUp);
+    ovBtn.addEventListener('click', function () { start(); });
+
+    hud();
+    showOv('ready');
+    raf = window.requestAnimationFrame(frame);
+
+    return {
+      teardown: function () {
+        window.cancelAnimationFrame(raf);
+        window.removeEventListener('keydown', onKey);
+        window.removeEventListener('keyup', onKeyUp);
+      },
+      pause: function () {},
+      resume: function () {},
+      isPlaying: function () { return state === 'playing'; }
+    };
+  }
+
+  /* ==================== 16 记住这个顺序 ==================== */
+  function createSequence(root) {
+    var $ = function (s) { return root.querySelector(s); };
+    root.innerHTML =
+      '<div class="gbar">' +
+        '<div class="stat"><span>等级</span><b class="js-lv">3</b></div>' +
+        '<div class="stat"><span>左边 / 右边</span><b class="js-score">0 : 0</b></div>' +
+        '<div class="stat"><span>最高等级</span><b class="js-best">3</b></div>' +
+      '</div>' +
+      '<div class="seq-wrap">' +
+        '<div class="seq-grid js-grid"></div>' +
+        '<div class="seq-hint js-hint">看一眼亮起来的格子</div>' +
+      '</div>' +
+      '<div class="rowline"><button class="btn ghost mini js-again" type="button">重开一局</button><span class="hint js-who" style="margin:0"></span></div>' +
+      '<div class="hint">亮起的顺序会越来越长。左边的人先复现，再轮到右边；谁记错，对面赢一局。</div>';
+
+    var SYM = ['✦', '●', '▲', '■', '★', '♥', '✿', '☾', '◈'];
+    var grid = $('.js-grid');
+    var hintEl = $('.js-hint'), whoEl = $('.js-who');
+
+    var cells = [];
+    SYM.forEach(function (sym, i) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'seq-cell';
+      b.textContent = sym;
+      b.setAttribute('data-i', i);
+      b.addEventListener('click', function () { tap(i); });
+      grid.appendChild(b);
+      cells.push(b);
+    });
+
+    var aWins = 0, bWins = 0;
+    var level = 3, best = stats.seqBest || 3;
+    var seq = [], pos = 0, turn = 'A', phase = 'idle', timers = [];
+
+    $('.js-best').textContent = best;
+
+    function hud() {
+      $('.js-lv').textContent = level;
+      $('.js-score').textContent = aWins + ' : ' + bWins;
+      $('.js-best').textContent = best;
+    }
+
+    function clearTimers() {
+      timers.forEach(function (t) { clearTimeout(t); });
+      timers = [];
+    }
+    function later(fn, ms) { timers.push(setTimeout(fn, ms)); }
+
+    function lock(on) {
+      cells.forEach(function (c) {
+        c.disabled = on;
+        c.classList.remove('lit', 'ok', 'bad');
+      });
+    }
+
+    function build() {
+      seq = [];
+      for (var i = 0; i < level; i++) seq.push(Math.floor(Math.random() * SYM.length));
+      pos = 0;
+    }
+
+    function flash(i, cls, ms) {
+      var c = cells[i];
+      if (!c) return;
+      c.classList.add(cls);
+      later(function () { c.classList.remove(cls); }, ms);
+    }
+
+    function show() {
+      phase = 'show';
+      lock(true);
+      hintEl.textContent = '记住顺序 · 一共 ' + seq.length + ' 个';
+      whoEl.textContent = '';
+      seq.forEach(function (v, i) {
+        later(function () { flash(v, 'lit', 380); Sfx.click(360 + v * 45); }, 520 + i * 620);
+      });
+      later(function () {
+        lock(false);
+        phase = 'input';
+        pos = 0;
+        hintEl.textContent = '轮到' + (turn === 'A' ? '左边' : '右边') + '了';
+        whoEl.textContent = turn === 'A' ? '左边先复现' : '右边接着复现';
+      }, 520 + seq.length * 620 + 200);
+    }
+
+    function tap(i) {
+      if (phase !== 'input') return;
+      if (seq[pos] === i) {
+        pos++;
+        flash(i, 'ok', 240);
+        Sfx.pop(pos);
+        if (pos >= seq.length) {
+          phase = 'pass';
+          if (turn === 'A') {
+            turn = 'B';
+            hintEl.textContent = '轮到右边了';
+            whoEl.textContent = '同一串，右边复现';
+            pos = 0;
+            later(function () { phase = 'input'; }, 420);
+          } else {
+            level++;
+            if (level > best) {
+              best = level;
+              stats.seqBest = best;
+              save(K.stats, stats);
+            }
+            hud();
+            hintEl.textContent = '两个人都记住了 · 下一串更长';
+            Sfx.win();
+            turn = turn === 'A' ? 'B' : 'A';
+            later(function () { build(); show(); }, 900);
+          }
+        }
+      } else {
+        phase = 'wait';
+        lock(true);
+        flash(i, 'bad', 420);
+        flash(seq[pos], 'ok', 420);
+        Sfx.click(180);
+        var winner = turn === 'A' ? '右边' : '左边';
+        if (turn === 'A') bWins++; else aWins++;
+        hud();
+        hintEl.textContent = '错了 · ' + winner + '赢下这一局';
+        whoEl.textContent = '重来，从头一串开始';
+        turn = turn === 'A' ? 'B' : 'A';
+        later(function () {
+          level = 3;
+          hud();
+          build();
+          show();
+        }, 1500);
+      }
+    }
+
+    $('.js-again').addEventListener('click', function () {
+      clearTimers();
+      aWins = 0; bWins = 0; level = 3; turn = 'A';
+      hud();
+      build();
+      show();
+      Sfx.click(480);
+    });
+
+    build();
+    hud();
+    show();
+
+    return {
+      teardown: function () { clearTimers(); },
+      pause: function () { clearTimers(); },
+      resume: function () {},
+      isPlaying: function () { return phase === 'input'; }
+    };
+  }
 
   /* ==================== 音效 ==================== */
   var Sfx = (function () {
